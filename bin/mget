@@ -7,6 +7,8 @@
 var fs = require('fs');
 var path = require('path-platform');
 var strsplit = require('strsplit');
+var url = require('url');
+var util = require('util');
 
 var assert = require('assert-plus');
 var bunyan = require('bunyan');
@@ -24,6 +26,16 @@ var manta = require('../lib');
  * @returns {Object} A dashdash options parser for the command.
  */
 function optionsParser(name) {
+    dashdash.addOptionType({
+        name: 'encryptAuthMode',
+        takesArg: true,
+        helpArg: 'MODE',
+        parseArg: function parseEncryptAuthMode(option, optstr, arg) {
+            manta.encryptValidateAuthMode(arg);
+            return (arg);
+        }
+    });
+
     var parser = dashdash.createParser({
         options: manta.DEFAULT_CLI_OPTIONS.concat([
             {
@@ -56,6 +68,31 @@ function optionsParser(name) {
                 type: 'bool',
                 help: 'write output to a file using remote object name as \
                        filename'
+            },
+            {
+                group: 'Client-side encryption options'
+            },
+            {
+                names: ['decrypt', 'e'],
+                type: 'bool',
+                help: 'Expect the object to be encrypted, and decrypt it.'
+            },
+            {
+                names: ['encrypt-key'],
+                type: 'string',
+                env: 'MANTA_ENCRYPT_KEY',
+                helpArg: 'KEY',
+                help: 'Base64 secret key for decrypting remote encrypted objects.'
+            },
+            {
+                names: ['encrypt-auth-mode'],
+                type: 'encryptAuthMode',
+                env: 'MANTA_ENCRYPT_AUTH_MODE',
+                helpArg: 'MODE',
+                help: 'Whether decryption will enforce authentication '
+                    + '("MandatoryAuthentication", the default) or allow some '
+                    + 'operations, e.g. range requests, which cannot enforce '
+                    + 'authentication ("OptionalAuthentication")'
             }
         ])
     });
@@ -142,6 +179,20 @@ function parseCmdOptions(opts, parser) {
         } else {
             opts.output = path.posix.basename(opts.paths[0]);
         }
+    }
+
+    if (opts.decrypt) {
+        if (!opts.encrypt_key) {
+            manta.cli_usage(OPTIONS_PARSER, 'decryption requires ' +
+                '--encrypt-key or the MANTA_ENCRYPT_KEY environment variable');
+        }
+        var base64Key = new Buffer(opts.encrypt_key, 'base64');
+        opts.encrypt = {
+            getKey: function (keyId, cb) {
+                cb(null, base64Key);
+            },
+            authMode: opts.encrypt_auth_mode
+        };
     }
 
     return (opts);
