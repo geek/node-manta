@@ -33,6 +33,7 @@ var SPECIALOBJ1 = SUBDIR1 + '/' + 'before-\r-after';
 
 var SUBDIR1_NOBJECTS = 1;
 var SUBDIR1_NDIRECTORIES = 2;
+var CSE_KEY = 'FFFFFFFBD96783C6C91E222211112222';
 
 
 /*
@@ -52,6 +53,9 @@ module.exports.setUp = function (cb) {
     var self = this;
     var url = process.env.MANTA_URL || 'http://localhost:8080';
     var user = process.env.MANTA_USER || 'admin';
+    function cse_getKey(keyId, next) {
+        next(null, CSE_KEY);
+    }
 
     function createClient(signer) {
         self.client = manta.createClient({
@@ -61,7 +65,8 @@ module.exports.setUp = function (cb) {
                                     false : true),
             sign: signer,
             url: url,
-            user: user
+            user: user,
+            cse_getKey: cse_getKey
         });
 
         cb();
@@ -163,6 +168,27 @@ test('#231: put (special characters)', function (t) {
     });
 });
 
+test('put (encrypt stream)', function (t) {
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var options = {
+      cse_key: CSE_KEY,
+      cse_keyId: 'dev/test',
+      cse_cipher: 'AES/CTR/NoPadding'
+    };
+
+    this.client.put(ROOT + '/encrypted', stream, options, function (err, res) {
+        t.ifError(err);
+        t.ok(res.req._headers['m-encrypt-key-id']);
+        t.done();
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
 test('#231: ls (special characters)', function (t) {
     this.client.ls(SUBDIR1, function (err, res) {
         t.ifError(err);
@@ -193,6 +219,93 @@ test('#231: get (special characters)', function (t) {
             t.equal(data, 'my filename can mess stuff up\n');
             t.done();
         });
+    });
+});
+
+test('get (decrypt stream)', function (t) {
+    var self = this;
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var fpath = ROOT + '/todecrypt';
+    var key = CSE_KEY;
+    var options = {
+      cse_key: key,
+      cse_keyId: 'dev/test',
+      cse_cipher: 'AES/CTR/NoPadding'
+    };
+
+    self.client.put(fpath, stream, options, function (putErr, putRes) {
+        t.ifError(putErr);
+        t.ok(putRes.req._headers['m-encrypt-key-id']);
+        setTimeout(function () {
+          self.client.get(fpath, function (getErr, decrypted, getRes) {
+              t.ifError(getErr);
+
+              var result = '';
+              decrypted.on('data', function (data) {
+                  result += data.toString();
+              });
+
+              decrypted.once('end', function () {
+                  t.ok(result === text);
+                  t.done();
+              });
+
+              decrypted.on('error', function (decErr) {
+                  t.ifError(decErr);
+              });
+          });
+        }, 10);
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+
+test('get (decrypt stream) by overriding getKey()', function (t) {
+    var self = this;
+    var text = 'The lazy brown fox';
+    var stream = new MemoryStream();
+    var fpath = ROOT + '/todecrypt_getKey';
+    var key = 'FFFFFFFBD96783C6C91E222211111111';
+    var options = {
+      cse_key: key,
+      cse_keyId: 'dev/test',
+      cse_cipher: 'AES/CTR/NoPadding'
+    };
+
+    function cse_getKey(keyId, next) {
+        next(null, key);
+    }
+
+    self.client.put(fpath, stream, options, function (putErr, putRes) {
+        t.ifError(putErr);
+        t.ok(putRes.req._headers['m-encrypt-key-id']);
+        setTimeout(function () {
+          self.client.get(fpath, {cse_getKey: cse_getKey},
+              function (getErr, decrypted, getRes) {
+
+              t.ifError(getErr);
+
+              var result = '';
+              decrypted.on('data', function (data) {
+                result += data.toString();
+              });
+
+              decrypted.once('end', function () {
+                t.ok(result === text);
+                t.done();
+              });
+          });
+        }, 10);
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
     });
 });
 
