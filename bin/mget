@@ -6,6 +6,9 @@
 
 var fs = require('fs');
 var path = require('path-platform');
+var strsplit = require('strsplit');
+var url = require('url');
+var util = require('util');
 
 var assert = require('assert-plus');
 var bunyan = require('bunyan');
@@ -16,46 +19,86 @@ var vasync = require('vasync');
 var manta = require('../lib');
 
 
-var NAME = path.basename(process.argv[1]);
-var LOG = bunyan.createLogger({
-    name: NAME,
-    level: (process.env.LOG_LEVEL || 'info'),
-    stream: process.stderr
-});
-
-var OPTIONS_PARSER = dashdash.createParser({
-    options: manta.DEFAULT_CLI_OPTIONS.concat([
-        {
-            group: NAME + ' options'
-        },
-        {
-            names: ['header', 'H'],
-            type: 'arrayOfString',
-            help: 'HTTP headers to include',
-            helpArg: 'HEADER'
-        },
-        {
-            names: ['quiet', 'q'],
-            type: 'bool',
-            help: 'disable the progress bar'
-        },
-        {
-            names: ['progress'],
-            type: 'bool',
-            help: 'force the progress bar to draw, even when stderr redirected'
-        },
-        {
-            names: ['output', 'o'],
-            type: 'string',
-            help: 'write output to <file> instead of stdout'
-        },
-        {
-            names: ['remote-name', 'O'],
-            type: 'bool',
-            help: 'write output to a file using remote object name as filename'
+/**
+ * Create a dashdash options parser for this command
+ *
+ * @param {String} name: Required. The command name.
+ * @returns {Object} A dashdash options parser for the command.
+ */
+function optionsParser(name) {
+    dashdash.addOptionType({
+        name: 'encryptAuthMode',
+        takesArg: true,
+        helpArg: 'MODE',
+        parseArg: function parseEncryptAuthMode(option, optstr, arg) {
+            manta.encryptValidateAuthMode(arg);
+            return (arg);
         }
-    ])
-});
+    });
+
+    var parser = dashdash.createParser({
+        options: manta.DEFAULT_CLI_OPTIONS.concat([
+            {
+                group: name + ' options'
+            },
+            {
+                names: ['header', 'H'],
+                type: 'arrayOfString',
+                help: 'HTTP headers to include',
+                helpArg: 'HEADER'
+            },
+            {
+                names: ['quiet', 'q'],
+                type: 'bool',
+                help: 'disable the progress bar'
+            },
+            {
+                names: ['progress'],
+                type: 'bool',
+                help: 'force the progress bar to draw, even when \
+                       stderr redirected'
+            },
+            {
+                names: ['output', 'o'],
+                type: 'string',
+                help: 'write output to <file> instead of stdout'
+            },
+            {
+                names: ['remote-name', 'O'],
+                type: 'bool',
+                help: 'write output to a file using remote object name as \
+                       filename'
+            },
+            {
+                group: 'Client-side encryption options'
+            },
+            {
+                names: ['decrypt', 'e'],
+                type: 'bool',
+                help: 'Expect the object to be encrypted, and decrypt it.'
+            },
+            {
+                names: ['encrypt-key'],
+                type: 'string',
+                env: 'MANTA_ENCRYPT_KEY',
+                helpArg: 'KEY',
+                help: 'Base64 secret key for decrypting remote encrypted objects.'
+            },
+            {
+                names: ['encrypt-auth-mode'],
+                type: 'encryptAuthMode',
+                env: 'MANTA_ENCRYPT_AUTH_MODE',
+                helpArg: 'MODE',
+                help: 'Whether decryption will enforce authentication '
+                    + '("MandatoryAuthentication", the default) or allow some '
+                    + 'operations, e.g. range requests, which cannot enforce '
+                    + 'authentication ("OptionalAuthentication")'
+            }
+        ])
+    });
+
+    return (parser);
+}
 
 
 function ifError(err) {
@@ -63,53 +106,6 @@ function ifError(err) {
         console.error('mget: ' + err.toString());
         process.exit(1);
     }
-}
-
-
-function parseOptions() {
-    var opts;
-
-    try {
-        opts = OPTIONS_PARSER.parse(process.argv);
-        manta.checkBinEnv(opts);
-    } catch (e) {
-        manta.cli_usage(OPTIONS_PARSER, e.message, 'path...');
-    }
-
-    manta.cli_logger(opts, LOG);
-
-    if (opts.help)
-        manta.cli_usage(OPTIONS_PARSER, false, 'path...');
-
-    manta.cliVersionCheckPrintAndExit(opts);
-    manta.cliCompletionCheckPrintAndExit(opts, OPTIONS_PARSER, NAME, ['mpath']);
-
-    if (opts._args.length < 1)
-        manta.cli_usage(OPTIONS_PARSER, 'path required', 'path...');
-
-    opts.paths = opts._args;
-
-    if (opts.remote_name) {
-        if (opts.paths.length !== 1) {
-            manta.cli_usage(OPTIONS_PARSER, '--remote-name only works with ' +
-              'a single object path', 'path...');
-        } else {
-            opts.output = path.posix.basename(opts.paths[0]);
-        }
-    }
-
-    opts.headers = {};
-    (opts.header || []).forEach(function (h) {
-        if (h.indexOf(':') === -1) {
-            manta.cli_usage(OPTIONS_PARSER,
-                            'header must be in the form of "[header]: value"',
-                            'path...');
-        }
-        var tmp = h.split(':');
-        opts.headers[tmp[0]] = tmp[1].trim();
-    });
-
-    return (opts);
 }
 
 
@@ -168,8 +164,57 @@ function downloadOne(dlo, done) {
 }
 
 
+/**
+ * Handle command-specific options parsing and checking.
+ *
+ * @param {Object} opts: Required. A parsed options object.
+ * @param {Object} parser: Required. A dashdash option parser.
+ * @returns {Object} A possibly mutated version of the `opts` input parameter.
+ */
+function parseCmdOptions(opts, parser) {
+    if (opts.remote_name) {
+        if (opts.paths.length !== 1) {
+            manta.cli_usage(parser, '--remote-name only works with ' +
+                            'a single object path', 'path...');
+        } else {
+            opts.output = path.posix.basename(opts.paths[0]);
+        }
+    }
+
+    if (opts.decrypt) {
+        if (!opts.encrypt_key) {
+            manta.cli_usage(OPTIONS_PARSER, 'decryption requires ' +
+                '--encrypt-key or the MANTA_ENCRYPT_KEY environment variable');
+        }
+        var base64Key = new Buffer(opts.encrypt_key, 'base64');
+        opts.encrypt = {
+            getKey: function (keyId, cb) {
+                cb(null, base64Key);
+            },
+            authMode: opts.encrypt_auth_mode
+        };
+    }
+
+    return (opts);
+}
+
+
 (function main() {
-    var opts = parseOptions();
+    var name = path.basename(process.argv[1]);
+    var log = bunyan.createLogger({
+        name: name,
+        level: (process.env.LOG_LEVEL || 'info'),
+        stream: process.stderr
+    });
+    var parser = optionsParser(name);
+    var parseArgs = {
+        name: name,
+        parser: parser,
+        argTypes: ['mpath'],
+        parseCmdOptions: parseCmdOptions,
+        log: log
+    };
+    var opts = manta.parseOptions(parseArgs);
     var client = manta.createBinClient(opts);
     var drawProgressBar = true;
 

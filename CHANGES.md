@@ -2,6 +2,73 @@
 
 ## not yet released
 
+## 5.1.0
+
+Minor version bump due to a backwards-compatible addition to the multipart
+upload client operations. The client operations now allow for a
+`partsDirectory` string on the options object for multipart upload methods,
+which is used as the URL of the request. Otherwise, the parts directory is
+resolved using the server's redirect endpoint.
+
+- joyent/node-manta#325 ask server for fully qualified upload path
+- joyent/node-manta#326 client could support accepting fully qualified upload
+  directory as input to MPU operations
+
+## 5.0.0
+
+If you do not check explicitly for `ResourceNotFoundErrors` from multipart
+upload operations, this major bump will not affect you. Code that checks for a
+`ResourceNotFoundError` in the error cause chain using
+[VError](https://github.com/joyent/node-verror)'s `findCauseByName` or
+`hasCauseWithName` will continue to work.
+
+Major bump due to a change in the errors that may be returned from client
+multipart upload operations. In particular, if Manta returns a
+`ResourceNotFoundError` for an MPU operation, it is presumed that the Manta
+deployment does not have the multipart upload API enabled. The client will now
+return a `FeatureNotSupportedError` from the methods `createUpload`,
+`uploadPart`, `abortUpload`, `getUpload`, and `commitUpload` in this case, with
+the `ResourceNotFoundError` preserved in the call chain.
+Code that specifically checks for the error name `ResourceNotFoundError` to
+detect whether multipart upload is supported should be updated appropriately
+to use VError.hasCauseWithName.
+
+- joyent/node-manta#320 client should detect if MPU is enabled
+- joyent/node-manta#319 MPU-related tests should detect if MPU is supported
+
+## 4.5.0
+
+Minor bump due to a backwards-compatible addition to the `commitUpload` method
+on the client. The `commitUpload` method now passes the response from the server
+to the callback.
+
+- joyent/node-manta#323 return response argument from client.commitUpload
+- joyent/node-manta#318 node-manta nodejs version support
+- joyent/node-manta#322 test7 make target should be test8 given node v8
+- joyent/node-manta#321 document mlogin's use of poseidon assets
+
+## 4.4.3
+
+- joyent/node-manta#244 mlogin could disable Manta's abort-on-core behavior
+
+## 4.4.2
+
+- joyent/node-manta#312 Custom header input should tolerate ':' characters
+
+## 4.4.1
+
+- joyent/node-manta#302 Create a manual page for `mmpu`
+- joyent/node-manta#311 `createUpload` incorrectly handles some target object headers
+
+## 4.4.0
+
+- joyent/node-manta#308 `mmpu commit` does not parse options
+- joyent/node-manta#309 MPU tests are out of sync with Muskie master branch implementation
+
+## 4.3.0
+
+- MANTA-2169: Support multipart upload of a single file to Manta
+
 ## 4.2.0
 
 Minor bump due to relaxation of API requirements in `mfind` (NotFound

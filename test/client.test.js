@@ -3,12 +3,15 @@
  */
 
 var exec = require('child_process').exec;
+var crypto = require('crypto');
 var fs = require('fs');
 var path = require('path');
 
+var bunyan = require('bunyan');
+var jsprim = require('jsprim');
 var libuuid = require('uuid');
 var MemoryStream = require('readable-stream/passthrough.js');
-var bunyan = require('bunyan');
+var verror = require('verror');
 
 var logging = require('./lib/logging');
 var manta = require('../lib');
@@ -20,19 +23,31 @@ var manta = require('../lib');
 
 var log = logging.createLogger();
 
+// Only GCM encryption supported after node v1.0.0
+var NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
+
 var JOB;
 var ROOT = '/' + (process.env.MANTA_USER || 'admin') + '/stor';
 var PUBLIC = '/' + (process.env.MANTA_USER || 'admin') + '/public';
 var SUBDIR1 = ROOT + '/node-manta-test-client-' + libuuid.v4().split('-')[0];
 var SUBDIR2 = SUBDIR1 + '/subdir2-' + libuuid.v4().split('-')[0]; // directory
+var SUBDIRCSE = ROOT + '/node-manta-test-cse-' + libuuid.v4().split('-')[0];
 var CHILD1 = SUBDIR1 + '/child1-' + libuuid.v4().split('-')[0]; // object
 var CHILD2 = SUBDIR2 + '/child2-' + libuuid.v4().split('-')[0]; // link
 var NOENTSUB1 = SUBDIR1 + '/a/b/c';
 var NOENTSUB2 = SUBDIR1 + '/d/e/f';
 var SPECIALOBJ1 = SUBDIR1 + '/' + 'before-\r-after';
+var MPU_ENABLED;
+var UPLOAD1; // committed upload
+var UPLOAD2; // aborted upload
+var PATH1 = ROOT + '/committed-obj';
+var PATH2 = ROOT + '/aborted-obj';
+var PATH3 = ROOT + '/#311-test';
+var ETAGS1 = [];
 
 var SUBDIR1_NOBJECTS = 1;
 var SUBDIR1_NDIRECTORIES = 2;
+var CSE_KEY = 'FFFFFFFBD96783C6C91E222211112222';
 
 
 /*
@@ -52,6 +67,9 @@ module.exports.setUp = function (cb) {
     var self = this;
     var url = process.env.MANTA_URL || 'http://localhost:8080';
     var user = process.env.MANTA_USER || 'admin';
+    function getKey(keyId, next) {
+        next(null, CSE_KEY);
+    }
 
     function createClient(signer) {
         self.client = manta.createClient({
@@ -60,7 +78,10 @@ module.exports.setUp = function (cb) {
             rejectUnauthorized: (process.env.MANTA_TLS_INSECURE ? false : true),
             sign: signer,
             url: url,
-            user: user
+            user: user,
+            encrypt: {
+                getKey: getKey
+            }
         });
 
         cb();
@@ -128,6 +149,13 @@ test('mkdir (sub)', function (t) {
     });
 });
 
+test('mkdir (cse)', function (t) {
+    this.client.mkdir(SUBDIRCSE, function (err) {
+        t.ifError(err);
+        t.done();
+    });
+});
+
 
 test('put', function (t) {
     var text = 'The lazy brown fox \nsomething \nsomething foo';
@@ -153,6 +181,59 @@ test('#231: put (special characters)', function (t) {
 
     this.client.put(SPECIALOBJ1, stream, {size: size}, function (err) {
         t.ifError(err);
+        t.done();
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+test('put (encrypt stream)', function (t) {
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var fpath = SUBDIRCSE + '/encrypted';
+    var options = {
+        encrypt: {
+            key: CSE_KEY,
+            keyId: 'dev/test',
+            cipher: 'AES256/CTR/NoPadding'
+        }
+    };
+
+    this.client.put(fpath, stream, options, function (err, res) {
+        t.ifError(err);
+        t.ok(res.req._headers['m-encrypt-key-id']);
+        t.done();
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+test('put (encrypt stream and metadata)', function (t) {
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var fpath = SUBDIRCSE + '/metadata';
+    var options = {
+        encrypt: {
+            key: CSE_KEY,
+            keyId: 'dev/test',
+            cipher: 'AES256/CTR/NoPadding'
+        },
+        headers: {
+            'e-hello1': 'world1',
+            'e-hello2': 'world2'
+        }
+    };
+
+    this.client.put(fpath, stream, options, function (err, res) {
+        t.ifError(err);
+        t.ok(res.req._headers['m-encrypt-key-id']);
+        t.ok(res.req._headers['m-encrypt-metadata']);
         t.done();
     });
 
@@ -194,6 +275,229 @@ test('#231: get (special characters)', function (t) {
         });
     });
 });
+
+test('get (range)', function (t) {
+    this.client.get(SPECIALOBJ1, { headers: { range: 'bytes=0-1' } },
+        function (err, stream) {
+
+        t.ifError(err);
+
+        var data = '';
+        stream.setEncoding('utf8');
+        stream.on('data', function (chunk) {
+            data += chunk;
+        });
+        stream.on('end', function (chunk) {
+            t.equal(data, 'my');
+            t.done();
+        });
+    });
+});
+
+test('get (decrypt stream & metadata)', function (t) {
+    var self = this;
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var fpath = SUBDIRCSE + '/todecrypt-metadata';
+    var key = CSE_KEY;
+    var options = {
+        encrypt: {
+            key: key,
+            keyId: 'dev/test',
+            cipher: 'AES256/CTR/NoPadding'
+        },
+        headers: {
+            'e-hello1': 'world1',
+            'e-hello2': 'world2'
+        }
+    };
+
+    self.client.put(fpath, stream, options, function (putErr, putRes) {
+        t.ifError(putErr);
+        t.ok(putRes.req._headers['m-encrypt-key-id']);
+        setTimeout(function () {
+          self.client.get(fpath, function (getErr, decrypted, getRes) {
+              t.ifError(getErr);
+
+              var result = '';
+              decrypted.on('data', function (data) {
+                  result += data.toString();
+              });
+
+              decrypted.on('error', function (decErr) {
+                  t.ifError(decErr);
+              });
+
+              decrypted.once('end', function () {
+                  t.ok(result === text);
+                  t.ok(getRes.headers['e-hello1'] === 'world1');
+                  t.ok(getRes.headers['e-hello2'] === 'world2');
+                  t.done();
+              });
+          });
+        }, 10);
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+
+test('get (decrypt stream with range)', function (t) {
+    var self = this;
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var fpath = SUBDIRCSE + '/todecrypt-range';
+    var key = CSE_KEY;
+    var options = {
+        encrypt: {
+            key: key,
+            keyId: 'dev/test',
+            cipher: 'AES256/CTR/NoPadding'
+        },
+        headers: {
+            'e-hello1': 'world1',
+            'e-hello2': 'world2'
+        }
+    };
+
+    self.client.put(fpath, stream, options, function (putErr, putRes) {
+
+        t.ifError(putErr);
+        t.ok(putRes.req._headers['m-encrypt-key-id']);
+        setTimeout(function () {
+          self.client.get(fpath, { headers: { range: 'bytes=0-10' } },
+              function (getErr, decrypted, getRes) {
+
+              t.ifError(getErr);
+
+              var result = '';
+              getRes.on('data', function (data) {
+                  result += data.toString();
+              });
+
+              decrypted.on('error', function (decErr) {
+                  t.ifError(decErr);
+              });
+
+              getRes.once('end', function () {
+                  t.ok(result);
+                  t.ok(getRes.headers['e-hello1'] === 'world1');
+                  t.ok(getRes.headers['e-hello2'] === 'world2');
+                  t.done();
+              });
+          });
+        }, 10);
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+
+test('get (decrypt stream) by overriding getKey()', function (t) {
+    var self = this;
+    var text = 'The lazy brown fox';
+    var stream = new MemoryStream();
+    var fpath = SUBDIRCSE + '/todecrypt_getKey';
+    var key = 'FFFFFFFBD96783C6C91E222211111111';
+    var options = {
+        encrypt: {
+            key: key,
+            keyId: 'dev/test',
+            cipher: 'AES256/CTR/NoPadding'
+        }
+    };
+
+    function getKey(keyId, next) {
+        next(null, key);
+    }
+
+    self.client.put(fpath, stream, options, function (putErr, putRes) {
+        t.ifError(putErr);
+        t.ok(putRes.req._headers['m-encrypt-key-id']);
+        setTimeout(function () {
+          self.client.get(fpath, {encrypt: {getKey: getKey}},
+              function (getErr, decrypted, getRes) {
+
+              t.ifError(getErr);
+
+              var result = '';
+              decrypted.on('data', function (data) {
+                result += data.toString();
+              });
+
+              decrypted.once('end', function () {
+                t.ok(result === text);
+                t.done();
+              });
+          });
+        }, 10);
+    });
+
+    process.nextTick(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+if (NODE_MAJOR) {
+    test('get (decrypt stream) with AEAD mode', function (t) {
+        var self = this;
+        var text = 'The lazy brown fox \nsomething \nsomething foo';
+        var stream = new MemoryStream();
+        var fpath = SUBDIRCSE + '/todecrypt-aead';
+        var key = CSE_KEY;
+        var options = {
+            encrypt: {
+                key: key,
+                keyId: 'dev/test',
+                cipher: 'AES256/GCM/NoPadding'
+            },
+            headers: {
+                'e-hello1': 'world1',
+                'e-hello2': 'world2',
+                'e-hello3': 'world3'
+            }
+        };
+
+        self.client.put(fpath, stream, options, function (putErr, putRes) {
+            t.ifError(putErr);
+            t.ok(putRes.req._headers['m-encrypt-key-id']);
+            setTimeout(function () {
+              self.client.get(fpath, function (getErr, decrypted, getRes) {
+                  t.ifError(getErr);
+
+                  var result = '';
+                  decrypted.on('data', function (data) {
+                      result += data.toString();
+                  });
+
+                  decrypted.on('error', function (decErr) {
+                      t.ifError(decErr);
+                  });
+
+                  decrypted.once('end', function () {
+                      t.ok(result === text);
+                      t.ok(getRes.headers['e-hello1'] === 'world1');
+                      t.ok(getRes.headers['e-hello2'] === 'world2');
+                      t.ok(getRes.headers['e-hello3'] === 'world3');
+                      t.done();
+                  });
+              });
+            }, 10);
+        });
+
+        process.nextTick(function () {
+            stream.write(text);
+            stream.end();
+        });
+    });
+}
 
 
 test('#231: rm (special characters)', function (t) {
@@ -716,6 +1020,298 @@ test('mkdirp/rmr', function (t) {
         self.client.rmr(SUBDIR1, function (err2) {
             t.ifError(err2);
             t.done();
+        });
+    });
+});
+
+test('create upload', function (t) {
+    var opts = {
+        account: this.client.user
+    };
+
+    this.client.createUpload(PATH1, opts, function (err, obj) {
+        if (err && verror.hasCauseWithName(err, 'FeatureNotSupportedError')) {
+            MPU_ENABLED = false;
+            console.log('WARNING: skipping test "create upload": multipart ' +
+                'upload is not enabled on this Manta deployment');
+            t.done();
+            return;
+        }
+        MPU_ENABLED = true;
+
+        t.ifError(err);
+        if (err) {
+            t.done();
+            return;
+        }
+
+        t.ok(obj);
+        t.ok(obj.id);
+        UPLOAD1 = obj.id;
+        t.done();
+    });
+});
+
+test('upload part', function (t) {
+    if (!MPU_ENABLED) {
+        console.log('WARNING: skipping test "upload part": multipart ' +
+            'upload is not enabled on this Manta deployment');
+        t.done();
+        return;
+    }
+
+    var text = 'The lazy brown fox \nsomething \nsomething foo';
+    var stream = new MemoryStream();
+    var opts = {
+        account: this.client.user,
+        md5: crypto.createHash('md5').update(text).digest('base64'),
+        size: Buffer.byteLength(text),
+        type: 'text/plain'
+    };
+
+    var pn = 0;
+    this.client.uploadPart(stream, UPLOAD1, pn, opts, function (err, res) {
+        t.ifError(err);
+        if (err) {
+            t.done();
+            return;
+        }
+
+        t.ok(res);
+        t.ok(res.headers && res.headers.etag);
+        ETAGS1[pn] = res.headers.etag;
+        t.done();
+    });
+
+    setImmediate(function () {
+        stream.write(text);
+        stream.end();
+    });
+});
+
+test('get upload', function (t) {
+    if (!MPU_ENABLED) {
+        console.log('WARNING: skipping test "get upload": multipart ' +
+            'upload is not enabled on this Manta deployment');
+        t.done();
+        return;
+    }
+
+    var opts = {
+        account: this.client.user
+    };
+
+    this.client.getUpload(UPLOAD1, opts, function (err, upload) {
+        t.ifError(err);
+        if (err) {
+            t.done();
+            return;
+        }
+
+        t.ok(upload);
+        t.equal(upload.id, UPLOAD1);
+        t.equal(upload.state, 'created');
+        t.done();
+    });
+});
+
+test('commit upload', function (t) {
+    if (!MPU_ENABLED) {
+        console.log('WARNING: skipping test "commit upload": multipart ' +
+            'upload is not enabled on this Manta deployment');
+        t.done();
+        return;
+    }
+
+    var opts = {
+        account: this.client.user
+    };
+
+    var self = this;
+    self.client.commitUpload(UPLOAD1, ETAGS1, opts, function (err, res) {
+        t.ifError(err);
+        if (err) {
+            t.done();
+            return;
+        }
+        t.ok(res);
+        t.equal(res.statusCode, 201);
+        self.client.getUpload(UPLOAD1, opts, function (err2, upload) {
+            t.ifError(err2);
+            if (err2) {
+                t.done();
+                return;
+            }
+            t.ok(upload);
+            t.equal(upload.id, UPLOAD1);
+            t.equal(upload.state, 'done');
+            t.equal(upload.result, 'committed');
+
+            self.client.get(PATH1, function (err3, stream) {
+                t.ifError(err3);
+                if (err3) {
+                    t.done();
+                    return;
+                }
+
+                var text = 'The lazy brown fox \nsomething \nsomething foo';
+                var data = '';
+                stream.setEncoding('utf8');
+                stream.on('data', function (chunk) {
+                    data += chunk;
+                });
+                stream.on('end', function (chunk) {
+                    t.equal(data, text);
+
+                    self.client.unlink(PATH1, opts, function (err4) {
+                        t.ifError(err4);
+                        if (err4) {
+                            t.done();
+                            return;
+                        }
+                        t.done();
+                    });
+                });
+            });
+        });
+    });
+});
+
+test('errant commit upload returns undefined res', function (t) {
+    if (!MPU_ENABLED) {
+        console.log('WARNING: skipping test "commit upload": multipart ' +
+            'upload is not enabled on this Manta deployment');
+        t.done();
+        return;
+    }
+
+    var opts = {
+        account: this.client.user
+    };
+    var self = this;
+    self.client.commitUpload(libuuid.v4(), ETAGS1, opts, function (err, res) {
+        t.ok(err);
+        t.ok(res === undefined);
+        t.done();
+    });
+});
+
+test('abort upload', function (t) {
+    if (!MPU_ENABLED) {
+        console.log('WARNING: skipping test "abort upload": multipart ' +
+            'upload is not enabled on this Manta deployment');
+        t.done();
+        return;
+    }
+
+    var opts = {
+        account: this.client.user
+    };
+
+    var self = this;
+    this.client.createUpload(PATH2, opts, function (err, obj) {
+        t.ifError(err);
+        if (err) {
+            t.done();
+            return;
+        }
+
+        t.ok(obj);
+        t.ok(obj.id);
+        UPLOAD2 = obj.id;
+
+        self.client.abortUpload(UPLOAD2, opts, function (err2) {
+            t.ifError(err2);
+            if (err2) {
+                t.done();
+                return;
+            }
+            self.client.getUpload(UPLOAD2, opts, function (err3, upload) {
+                t.ifError(err3);
+                if (err3) {
+                    t.done();
+                    return;
+                }
+                t.ok(upload);
+                t.equal(upload.id, UPLOAD2);
+                t.equal(upload.state, 'done');
+                t.equal(upload.result, 'aborted');
+
+                t.done();
+            });
+        });
+    });
+});
+
+test('#311: create upload with special headers', function (t) {
+    if (!MPU_ENABLED) {
+        console.log('WARNING: skipping test: "#311: create upload with ' +
+            'special headers": multipart upload is not enabled on this ' +
+            'Manta deployment');
+        t.done();
+        return;
+    }
+
+    /*
+     * Test adding some headers to the target object that are also parsed by
+     * the Manta client, to ensure the headers for the target object are sent
+     * in the body of the `mpu-create` request, not as headers on the request
+     * itself.
+     */
+    var headers = {
+        'accept':  'acceptstring',
+        'role': 'rolestring',
+        'content-length': 10,
+        'content-md5': 'md5string',
+        'content-type': 'text/plain',
+        'expect': '100-continue',
+        'location': 'locationstring',
+        'x-request-id': 'requestidstring'
+    };
+
+    var self = this;
+    var createOpts = {
+        account: self.client.user,
+        headers: headers
+    };
+
+    self.client.createUpload(PATH3, createOpts, function (err, obj) {
+        t.ifError(err);
+        if (err) {
+            t.done();
+            return;
+        }
+
+        t.ok(obj);
+        t.ok(obj.id);
+        var id = obj.id;
+
+        var getOpts = {
+            account: self.client.user
+        };
+        self.client.getUpload(id, getOpts, function (err2, upload) {
+            t.ifError(err2);
+            if (err2) {
+                t.done();
+                return;
+            }
+
+            t.ok(upload);
+            t.equal(upload.id, id);
+            t.ok(upload.headers);
+            t.ok(jsprim.deepEqual(headers, upload.headers));
+
+            var abortOpts = {
+                account: self.client.user
+            };
+            self.client.abortUpload(id, abortOpts, function (err3) {
+                t.ifError(err3);
+                if (err3) {
+                    t.done();
+                    return;
+                }
+                t.done();
+            });
         });
     });
 });
